@@ -1,0 +1,25 @@
+{
+  "name": "cbio-deployment-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "test": "bun test --timeout 30000",
+    "typecheck": "tsgo --noEmit",
+    "check": "bun run typecheck && bun run test",
+    "format": "prettier --write src test package.json tsconfig.json",
+    "format:check": "prettier --check src test package.json tsconfig.json",
+    "build": "bun build src/server.ts --target=bun --outdir=dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@types/bun": "^1.4.2",
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "prettier": "^3.9.9"
+  }
+}
