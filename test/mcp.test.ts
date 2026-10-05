@@ -40,7 +40,7 @@ test("waiting imports stream progress through the MCP protocol and retain data o
   const { InMemoryTransport } = await import("@modelcontextprotocol/client");
   const { createMcpServer } = await import("../src/server");
   const { Deployments, deploySchema } = await import("../src/deployments");
-  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { mkdir, writeFile, readFile } = await import("node:fs/promises");
   const root = await mkdtemp(join(tmpdir(), "cbio-mcp-progress-"));
   const id = "cbio-mcp-abcdef123456";
   const directory = join(root, id);
@@ -50,6 +50,12 @@ test("waiting imports stream progress through the MCP protocol and retain data o
   await writeFile(
     join(study, "meta_study.txt"),
     "cancer_study_identifier: test\n",
+  );
+  const secondStudy = join(root, "second-study");
+  await mkdir(secondStudy);
+  await writeFile(
+    join(secondStudy, "meta_study.txt"),
+    "cancer_study_identifier: test2\n",
   );
   const http = Bun.serve({
     port: 0,
@@ -74,7 +80,15 @@ test("waiting imports stream progress through the MCP protocol and retain data o
       updatedAt: "now",
     }),
   );
-  const service = new Deployments(root, async () => {
+  const importedMeta: string[] = [];
+  const service = new Deployments(root, async (argv) => {
+    if (argv.includes("run")) {
+      const mount = argv.find((value) => value.endsWith(":/study"));
+      if (!mount) throw new Error("Missing study mount");
+      importedMeta.push(
+        await readFile(join(mount.slice(0, -7), "meta_study.txt"), "utf8"),
+      );
+    }
     await Bun.sleep(50);
     return "";
   });
@@ -90,13 +104,21 @@ test("waiting imports stream progress through the MCP protocol and retain data o
     const response = await client.callTool(
       {
         name: "import_studies",
-        arguments: { id, studies: [study], waitForCompletion: true },
+        arguments: {
+          id,
+          studies: [study, secondStudy],
+          waitForCompletion: true,
+        },
       },
       { onprogress: (progress) => notifications.push(progress.progress) },
     );
     expect(response.isError).not.toBe(true);
     expect(notifications.length).toBeGreaterThan(0);
-    expect(notifications.at(-1)).toBe(4);
+    expect(notifications.at(-1)).toBe(5);
+    expect(importedMeta).toEqual([
+      "cancer_study_identifier: test\n",
+      "cancer_study_identifier: test2\n",
+    ]);
     expect(service.status(id).phase).toBe("ready");
     expect(service.status(id).progress?.stage).toBe("Complete");
   } finally {

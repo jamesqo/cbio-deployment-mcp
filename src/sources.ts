@@ -21,7 +21,7 @@ export const sourceSchema = z.union([
   z
     .object({
       kind: z.literal("github"),
-      base: revision.default({ ref: "master" }),
+      base: revision.default({ ref: "HEAD" }),
       merge,
     })
     .strict(),

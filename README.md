@@ -56,12 +56,12 @@ Or combine branches and PRs independently for the backend and importer:
 {
   "cbioportal": {
     "kind": "github",
-    "base": { "ref": "master" },
+    "base": { "ref": "HEAD" },
     "merge": [{ "pr": 100 }, { "ref": "feature-branch" }]
   },
   "core": {
     "kind": "github",
-    "base": { "ref": "master" },
+    "base": { "ref": "HEAD" },
     "merge": [{ "pr": 183 }, { "pr": 191 }]
   },
   "port": 18081
@@ -80,7 +80,7 @@ Resolve and commit them in that checkout, then use it as a local source. Existin
 containers are untouched by a failed build or importer merge. Default `redeploy` rebuilds
 the saved backend snapshot; `refreshRefs: true` fetches/resnapshots current sources and
 invalidates the cached importer image. The optional core source controls the importer,
-not a backend Maven dependency. If omitted, core defaults to GitHub `master`.
+not a backend Maven dependency. If omitted, core defaults to the GitHub repository’s default branch.
 
 ## Tools
 
@@ -142,5 +142,5 @@ timeouts and payload sizes. Database addresses and credentials are generated int
 
 `bun run check` covers Git snapshots and merges, conflicts, deployment isolation, failed
 replacement builds, API requests, stdio MCP interoperability and streamed import progress.
-`sg docker -c 'bun test/smoke.ts'` is a separate real Docker build/import/redeploy smoke test
+`sg docker -c 'bun test/smoke.ts'` is a separate real Docker build/import/configure/restart/redeploy smoke test
 using the local cBioPortal/core clones; it removes its dedicated containers and data afterward.

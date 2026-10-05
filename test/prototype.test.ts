@@ -371,3 +371,23 @@ test("cancelling an import removes only its owned importer container and copied 
     (await readdir(path)).some((name) => name.startsWith("imports-")),
   ).toBe(false);
 });
+
+test("omitted GitHub base follows the remote HEAD rather than assuming a branch name", async () => {
+  const { path, git } = await repository();
+  const sha = await git(["rev-parse", "HEAD"]);
+  const execute: typeof run = (argv, options) =>
+    run(
+      argv.includes("remote") && argv.includes("add")
+        ? [...argv.slice(0, -1), path]
+        : argv,
+      options,
+    );
+  const hashes = await snapshot(
+    sourceSchema.parse({ kind: "github" }),
+    "cbioportal-core",
+    join(directory, "default"),
+    undefined,
+    execute,
+  );
+  expect(hashes).toEqual([sha]);
+});
