@@ -9,6 +9,7 @@ export function properties(deployment: Deployment): string {
       "com.clickhouse.jdbc.ClickHouseDriver",
     clickhouse_mode: "true",
     authenticate: "false",
+    "server.forward-headers-strategy": "framework",
     "spring.profiles.active": "clickhouse",
     "session.service.url": "http://session:5001/api/sessions/my_portal/",
   };

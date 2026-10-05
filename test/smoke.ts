@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { resolve, join } from "node:path";
 import { z } from "zod/v4";
 import { Deployments } from "../src/deployments";
+import { checkProxyOrigin } from "./proxy-smoke";
 
 const service = new Deployments();
 await service.initialize();
@@ -66,6 +67,7 @@ try {
   });
   await ready(id);
   console.log("Imported:", await imported(id));
+  await checkProxyOrigin(service.status(id).url);
   const response = await service.api(id, {
     method: "POST",
     path: "/api/studies/fetch",
