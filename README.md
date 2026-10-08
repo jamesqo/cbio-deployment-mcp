@@ -7,6 +7,30 @@ supports API checks against the same instance.
 
 ## Run
 
+### Container on Linux
+
+```sh
+docker build -t cbio-deployment-mcp:local .
+./docker/run.sh /absolute/path/to/local/repos /absolute/path/to/studies
+```
+
+The image includes Bun, Git, CA certificates, and Docker CLI with Compose and
+Buildx. Backend/importer builds supply their own Java, Maven and Python environments.
+Playwright stays separate from the MCP runtime.
+
+Use the absolute path to `docker/run.sh` as your MCP client's `command`, with
+optional repo/study directories in `args`. It runs stdio without a TTY. Set
+`CBIO_MCP_IMAGE` to choose the image and `CBIO_MCP_HOME` to choose the state directory.
+
+This uses the host Docker socket, so deployments belong to the host daemon;
+DinD is not required. The launcher uses host networking to reach deployment
+loopback ports, keeps the host UID/GID and adds the socket group. It mounts state
+at the same absolute path on both sides so Docker can resolve sibling-container
+bind mounts. Local input directories are mounted read-only. Use one server per
+state directory. This launcher targets Linux Docker Engine.
+
+### Directly with Bun
+
 Requires Bun, Git, Docker with Compose, and enough memory for Maven builds and cBioPortal.
 The first build downloads Maven dependencies and Docker images.
 
