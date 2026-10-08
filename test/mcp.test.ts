@@ -17,7 +17,11 @@ test("stdio server lists tools and returns validated responses", async () => {
     await client.connect(transport);
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name)).toContain("import_studies");
-    expect(tools.tools).toHaveLength(10);
+    expect(tools.tools.map((tool) => tool.name)).toContain("delete_studies");
+    expect(tools.tools.map((tool) => tool.name)).toContain(
+      "refresh_derived_tables",
+    );
+    expect(tools.tools).toHaveLength(12);
     const deployments = await client.callTool({
       name: "list_deployments",
       arguments: {},

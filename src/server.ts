@@ -7,6 +7,7 @@ import {
   deploySchema,
   identifierSchema,
   importSchema,
+  deleteSchema,
   propertySchema,
 } from "./deployments";
 
@@ -45,6 +46,57 @@ export function createMcpServer(deployments: Deployments) {
       },
     );
   }
+  async function waitForOperation(id: string, context: ServerContext) {
+    const cancel = () => deployments.cancel(id);
+    if (context.mcpReq.signal.aborted) cancel();
+    context.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+    let lastProgress = -1;
+    try {
+      while (deployments.status(id).busy) {
+        context.mcpReq.signal.throwIfAborted();
+        const progress = deployments.status(id).progress;
+        const token = context.mcpReq._meta?.progressToken;
+        if (
+          progress &&
+          progress.completed > lastProgress &&
+          (typeof token === "number" || typeof token === "string")
+        ) {
+          await context.mcpReq.notify({
+            method: "notifications/progress",
+            params: {
+              progressToken: token,
+              progress: progress.completed,
+              total: progress.total,
+              message: progress.stage,
+            },
+          });
+        }
+        if (progress) lastProgress = Math.max(lastProgress, progress.completed);
+        await Bun.sleep(1000);
+      }
+      const state = deployments.status(id);
+      const token = context.mcpReq._meta?.progressToken;
+      if (
+        state.progress &&
+        state.progress.completed > lastProgress &&
+        (typeof token === "number" || typeof token === "string")
+      )
+        await context.mcpReq.notify({
+          method: "notifications/progress",
+          params: {
+            progressToken: token,
+            progress: state.progress.completed,
+            total: state.progress.total,
+            message: state.progress.stage,
+          },
+        });
+      if (state.phase === "failed")
+        throw new Error(`${state.id}: ${state.error}`);
+      return state;
+    } finally {
+      context.mcpReq.signal.removeEventListener("abort", cancel);
+    }
+  }
   tool(
     "deploy",
     "Build cBioPortal sources and start an isolated localhost Docker deployment. Returns immediately; poll status and logs for readiness. Core source selects the importer when importing studies.",
@@ -59,7 +111,7 @@ export function createMcpServer(deployments: Deployments) {
   );
   tool(
     "status",
-    "Get build/import progress and source revisions. Ready means /api/studies responded successfully.",
+    "Get build/import/deletion progress and source revisions. Ready means /api/studies responded successfully.",
     identifierSchema,
     ({ id }) => deployments.status(id),
   );
@@ -100,56 +152,29 @@ export function createMcpServer(deployments: Deployments) {
     async ({ waitForCompletion, ...input }, context) => {
       const started = await deployments.importStudies(input);
       if (!waitForCompletion) return started;
-      const cancel = () => deployments.cancel(started.id);
-      if (context.mcpReq.signal.aborted) cancel();
-      context.mcpReq.signal.addEventListener("abort", cancel, { once: true });
-      let lastProgress = -1;
-      try {
-        while (deployments.status(started.id).busy) {
-          context.mcpReq.signal.throwIfAborted();
-          const progress = deployments.status(started.id).progress;
-          const token = context.mcpReq._meta?.progressToken;
-          if (
-            progress &&
-            progress.completed > lastProgress &&
-            (typeof token === "number" || typeof token === "string")
-          ) {
-            await context.mcpReq.notify({
-              method: "notifications/progress",
-              params: {
-                progressToken: token,
-                progress: progress.completed,
-                total: progress.total,
-                message: progress.stage,
-              },
-            });
-          }
-          if (progress)
-            lastProgress = Math.max(lastProgress, progress.completed);
-          await Bun.sleep(1000);
-        }
-        const state = deployments.status(started.id);
-        const token = context.mcpReq._meta?.progressToken;
-        if (
-          state.progress &&
-          state.progress.completed > lastProgress &&
-          (typeof token === "number" || typeof token === "string")
-        )
-          await context.mcpReq.notify({
-            method: "notifications/progress",
-            params: {
-              progressToken: token,
-              progress: state.progress.completed,
-              total: state.progress.total,
-              message: state.progress.stage,
-            },
-          });
-        if (state.phase === "failed")
-          throw new Error(`${state.id}: ${state.error}`);
-        return state;
-      } finally {
-        context.mcpReq.signal.removeEventListener("abort", cancel);
-      }
+      return waitForOperation(started.id, context);
+    },
+  );
+  tool(
+    "delete_studies",
+    "Delete one or more study IDs from this deployment using its core importer, rebuild derived tables and restart the backend. All IDs must exist. Deletions are sequential and not transactional; inspect logs on failure.",
+    deleteSchema.extend({ waitForCompletion: z.boolean().default(false) }),
+    async ({ waitForCompletion, ...input }, context) => {
+      const started = await deployments.deleteStudies(input);
+      return waitForCompletion
+        ? waitForOperation(started.id, context)
+        : started;
+    },
+  );
+  tool(
+    "refresh_derived_tables",
+    "Rebuild derived tables using this deployment’s backend SQL, then restart the backend and verify readiness. Preserves studies; returns immediately unless waitForCompletion=true.",
+    identifierSchema.extend({ waitForCompletion: z.boolean().default(false) }),
+    ({ id, waitForCompletion }, context) => {
+      const started = deployments.refreshDerivedTables(id);
+      return waitForCompletion
+        ? waitForOperation(started.id, context)
+        : started;
     },
   );
   tool(

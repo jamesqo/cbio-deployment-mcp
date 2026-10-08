@@ -17,7 +17,13 @@ import { z } from "zod/v4";
 import { run } from "./process";
 import { apiRequest, apiSchema } from "./api";
 import { sourceSchema, snapshot, prepareBackend } from "./sources";
-import { compose, properties, initScript, importScript } from "./compose";
+import {
+  compose,
+  properties,
+  initScript,
+  importScript,
+  deleteScript,
+} from "./compose";
 
 const idSchema = z.string().regex(/^cbio-mcp-[a-f0-9]{12}$/);
 export const propertySchema = z
@@ -70,6 +76,7 @@ const stateSchema = deploySchema.extend({
     "starting",
     "ready",
     "importing",
+    "deleting",
     "restarting",
     "stopped",
     "failed",
@@ -85,6 +92,18 @@ export const importSchema = identifierSchema.extend({
   genePanels: z.array(z.string().min(1)).max(100).default([]),
   overrideWarnings: z.boolean().default(false),
 });
+
+export const deleteSchema = identifierSchema.extend({
+  studyIds: z
+    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$/))
+    .min(1)
+    .max(20)
+    .refine(
+      (ids) => new Set(ids).size === ids.length,
+      "Study IDs must be unique",
+    ),
+});
+const studiesSchema = z.array(z.object({ studyId: z.string() }));
 
 export class Deployments {
   private readonly states = new Map<string, Deployment>();
@@ -428,6 +447,56 @@ export class Deployments {
       await this.save(state);
     });
   }
+  private async ensureImporter(state: Deployment, signal: AbortSignal) {
+    const directory = this.directory(state.id);
+    if (!state.importerImage) {
+      const core = join(directory, `core-${randomBytes(6).toString("hex")}`);
+      state.coreResolved = await snapshot(
+        state.core ?? sourceSchema.parse({ kind: "github" }),
+        "cbioportal-core",
+        core,
+        signal,
+      );
+      const image = `${state.id}:importer-${state.generation}`;
+      await this.docker(["build", "-t", image, core], state, signal);
+      state.importerImage = image;
+      await this.save(state);
+    }
+    return state.importerImage;
+  }
+  private async refreshAfterDataChange(
+    state: Deployment,
+    count: number,
+    signal: AbortSignal,
+  ) {
+    state.progress = {
+      completed: count + 1,
+      total: count + 3,
+      stage: "Rebuilding derived tables",
+    };
+    await this.save(state);
+    await this.compose(state, ["stop", "app"], signal);
+    await this.compose(
+      state,
+      [
+        "exec",
+        "-T",
+        "database",
+        "sh",
+        "-c",
+        'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database "$CLICKHOUSE_DB" --multiquery --param_optimize_backoff_secs=0 < /runtime/derived.sql',
+      ],
+      signal,
+    );
+    state.progress = {
+      completed: count + 2,
+      total: count + 3,
+      stage: "Starting backend",
+    };
+    await this.save(state);
+    await this.compose(state, ["up", "-d", "app"], signal);
+    await this.waitReady(state, signal);
+  }
   async importStudies(input: z.input<typeof importSchema>) {
     const parsed = importSchema.parse(input);
     const state = this.get(parsed.id);
@@ -447,19 +516,7 @@ export class Deployments {
       };
       await this.save(state);
       const directory = this.directory(state.id);
-      if (!state.importerImage) {
-        const core = join(directory, `core-${randomBytes(6).toString("hex")}`);
-        state.coreResolved = await snapshot(
-          state.core ?? sourceSchema.parse({ kind: "github" }),
-          "cbioportal-core",
-          core,
-          signal,
-        );
-        const image = `${state.id}:importer-${state.generation}`;
-        await this.docker(["build", "-t", image, core], state, signal);
-        state.importerImage = image;
-        await this.save(state);
-      }
+      const importerImage = await this.ensureImporter(state, signal);
       const runtime = join(directory, "runtime");
       await writeFile(join(runtime, "import.sh"), importScript, {
         mode: 0o644,
@@ -489,6 +546,8 @@ export class Deployments {
                 "run",
                 "--name",
                 `${state.id}-import`,
+                "--memory",
+                "4g",
                 "--network",
                 `${state.id}_default`,
                 "-v",
@@ -505,7 +564,7 @@ export class Deployments {
                 "PYTHONUNBUFFERED=1",
                 "--entrypoint",
                 "sh",
-                state.importerImage,
+                importerImage,
                 "/runtime/import.sh",
                 ...(parsed.overrideWarnings ? ["-o"] : []),
               ],
@@ -526,33 +585,7 @@ export class Deployments {
               await this.docker(["rm", "-f", `${state.id}-import`], state);
           }
         }
-        state.progress = {
-          completed: paths.length + 1,
-          total: paths.length + 3,
-          stage: "Rebuilding derived tables",
-        };
-        await this.save(state);
-        await this.compose(state, ["stop", "app"], signal);
-        await this.compose(
-          state,
-          [
-            "exec",
-            "-T",
-            "database",
-            "sh",
-            "-c",
-            'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database "$CLICKHOUSE_DB" --multiquery --param_optimize_backoff_secs=0 < /runtime/derived.sql',
-          ],
-          signal,
-        );
-        state.progress = {
-          completed: paths.length + 2,
-          total: paths.length + 3,
-          stage: "Starting backend",
-        };
-        await this.save(state);
-        await this.compose(state, ["up", "-d", "app"], signal);
-        await this.waitReady(state, signal);
+        await this.refreshAfterDataChange(state, paths.length, signal);
         state.phase = "ready";
         state.progress = {
           completed: paths.length + 3,
@@ -566,6 +599,122 @@ export class Deployments {
         if (state.phase !== "ready")
           await this.compose(state, ["up", "-d", "app"]);
         await rm(imports, { recursive: true, force: true });
+      }
+    });
+  }
+  async deleteStudies(input: z.input<typeof deleteSchema>) {
+    const parsed = deleteSchema.parse(input);
+    const state = this.get(parsed.id);
+    const before = await this.api(state.id, {
+      path: "/api/studies",
+      query: { projection: "SUMMARY" },
+    });
+    if (before.status !== 200)
+      throw new Error("Could not list studies before deletion");
+    const existingIds = new Set(
+      studiesSchema.parse(before.body).map((study) => study.studyId),
+    );
+    const missing = parsed.studyIds.filter((id) => !existingIds.has(id));
+    if (missing.length)
+      throw new Error(`Unknown study IDs: ${missing.join(", ")}`);
+    return this.start(state, "delete_studies", async (signal) => {
+      state.phase = "deleting";
+      state.progress = { completed: 0, total: 4, stage: "Preparing importer" };
+      await this.save(state);
+      const runtime = join(this.directory(state.id), "runtime");
+      try {
+        const image = await this.ensureImporter(state, signal);
+        await writeFile(join(runtime, "delete.sh"), deleteScript);
+        await this.compose(state, ["stop", "app"], signal);
+        state.progress = {
+          completed: 1,
+          total: 4,
+          stage: `Deleting ${parsed.studyIds.length} studies`,
+        };
+        await this.save(state);
+        try {
+          await this.docker(
+            [
+              "run",
+              "--name",
+              `${state.id}-delete`,
+              "--memory",
+              "4g",
+              "--network",
+              `${state.id}_default`,
+              "-v",
+              `${runtime}:/runtime:ro`,
+              "-e",
+              "PORTAL_HOME=/runtime",
+              "-e",
+              "PYTHONUNBUFFERED=1",
+              "--entrypoint",
+              "sh",
+              image,
+              "/runtime/delete.sh",
+              parsed.studyIds.join(","),
+            ],
+            state,
+            signal,
+          );
+        } finally {
+          const container = await this.execute([
+            "docker",
+            "--host",
+            localDockerHost(),
+            "ps",
+            "-aq",
+            "--filter",
+            `name=^${state.id}-delete$`,
+          ]);
+          if (container)
+            await this.docker(["rm", "-f", `${state.id}-delete`], state);
+        }
+        await this.refreshAfterDataChange(state, 1, signal);
+        const after = await apiRequest(
+          state.port,
+          { path: "/api/studies", query: { projection: "SUMMARY" } },
+          signal,
+        );
+        if (after.status !== 200)
+          throw new Error("Could not verify study deletion");
+        const remaining = new Set(
+          studiesSchema.parse(after.body).map((study) => study.studyId),
+        );
+        const undeleted = parsed.studyIds.filter((id) => remaining.has(id));
+        if (undeleted.length)
+          throw new Error(
+            `Studies still present after deletion: ${undeleted.join(", ")}`,
+          );
+        state.phase = "ready";
+        state.progress = { completed: 4, total: 4, stage: "Complete" };
+        state.operation = `Deleted ${parsed.studyIds.length} studies`;
+        await this.save(state);
+      } finally {
+        if (state.phase !== "ready")
+          await this.compose(state, ["up", "-d", "app"]);
+      }
+    });
+  }
+  refreshDerivedTables(id: string) {
+    const state = this.get(id);
+    if (state.phase !== "ready")
+      throw new Error(
+        "Deployment must be ready before refreshing derived tables",
+      );
+    return this.start(state, "refresh_derived_tables", async (signal) => {
+      state.phase = "restarting";
+      state.progress = { completed: 0, total: 3, stage: "Preparing refresh" };
+      await this.save(state);
+      try {
+        await this.refreshAfterDataChange(state, 0, signal);
+        state.phase = "ready";
+        state.progress = { completed: 3, total: 3, stage: "Complete" };
+        state.operation = "Refreshed derived tables";
+        await this.save(state);
+      } finally {
+        if (state.phase !== "ready")
+          await this.compose(state, ["up", "-d", "app"]);
       }
     });
   }

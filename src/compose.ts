@@ -29,6 +29,7 @@ export function compose(deployment: Deployment, directory: string) {
     services: {
       database: {
         image: "clickhouse/clickhouse-server:25.3",
+        mem_limit: "3g",
         environment: {
           CLICKHOUSE_DB: deployment.database,
           CLICKHOUSE_USER: "cbio_user",
@@ -50,9 +51,14 @@ export function compose(deployment: Deployment, directory: string) {
           retries: 60,
         },
       },
-      mongo: { image: "mongo:4.2", volumes: ["sessions:/data/db"] },
+      mongo: {
+        image: "mongo:4.2",
+        mem_limit: "512m",
+        volumes: ["sessions:/data/db"],
+      },
       session: {
         image: "cbioportal/session-service:0.6.4",
+        mem_limit: "1g",
         environment: {
           SERVER_PORT: "5001",
           JAVA_OPTS:
@@ -62,6 +68,7 @@ export function compose(deployment: Deployment, directory: string) {
       },
       app: {
         image: deployment.image,
+        mem_limit: "3g",
         ports: [`127.0.0.1:${deployment.port}:8080`],
         volumes: [
           `${runtime}/application.properties:/config/application.properties:ro`,
@@ -103,4 +110,12 @@ if grep -q -- '--no-derive-tables' /scripts/importer/metaImport.py; then
   set -- --no-derive-tables "$@"
 fi
 python3 /scripts/importer/metaImport.py -s /study -n -jar "$jarfile" --java_opts=-Xmx2g "$@"
+`;
+
+export const deleteScript = `set -eu
+jarfile=$(find / -maxdepth 1 -name 'core-*.jar' -print -quit)
+test -n "$jarfile"
+cd /runtime
+jar uf "$jarfile" application.properties
+python3 /scripts/importer/cbioportalImporter.py remove-study --study_ids "$1" -jar "$jarfile" --java_opts=-Xmx2g
 `;
