@@ -15,15 +15,10 @@ import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { z } from "zod/v4";
 import { run } from "./process";
+import { DockerRuntime, type DeploymentRuntime } from "./runtime";
 import { apiRequest, apiSchema } from "./api";
 import { sourceSchema, snapshot, prepareBackend } from "./sources";
-import {
-  compose,
-  properties,
-  initScript,
-  importScript,
-  deleteScript,
-} from "./compose";
+import { properties, initScript, importScript, deleteScript } from "./compose";
 
 const idSchema = z.string().regex(/^cbio-mcp-[a-f0-9]{12}$/);
 export const propertySchema = z
@@ -116,7 +111,8 @@ export class Deployments {
       process.env.CBIO_MCP_HOME ??
         join(homedir(), ".local/share/cbio-deployment-mcp"),
     ),
-    private readonly execute = run,
+    execute = run,
+    private readonly runtime: DeploymentRuntime = new DockerRuntime(execute),
   ) {}
 
   async initialize() {
@@ -176,46 +172,11 @@ export class Deployments {
       properties(state),
       { mode: 0o600 },
     );
-    await writeFile(
-      join(directory, "compose.json"),
-      JSON.stringify(compose(state, directory), null, 2),
-      { mode: 0o600 },
-    );
+    await this.runtime.prepare(this.context(state));
     await this.save(state);
   }
-  private async docker(
-    args: string[],
-    state: Deployment,
-    signal?: AbortSignal,
-  ) {
-    // Only the local Unix socket is supported. Never select a cluster/cloud Docker context.
-    if (
-      process.env.DOCKER_HOST &&
-      !process.env.DOCKER_HOST.startsWith("unix://")
-    )
-      throw new Error("Only local Unix-socket Docker is supported");
-    await this.execute(["docker", "--host", localDockerHost(), ...args], {
-      log: join(this.directory(state.id), "operations.log"),
-      signal,
-    });
-  }
-  private async compose(
-    state: Deployment,
-    args: string[],
-    signal?: AbortSignal,
-  ) {
-    await this.docker(
-      [
-        "compose",
-        "-p",
-        state.id,
-        "-f",
-        join(this.directory(state.id), "compose.json"),
-        ...args,
-      ],
-      state,
-      signal,
-    );
+  private context(state: Deployment) {
+    return { state, directory: this.directory(state.id) };
   }
   private start(
     state: Deployment,
@@ -309,19 +270,16 @@ export class Deployments {
       await prepareBackend(backend);
     }
     const image = `${state.id}:${generation}`;
-    await this.docker(
-      [
-        "build",
-        "-t",
+    await this.runtime.build(
+      this.context(state),
+      {
         image,
-        "-f",
-        join(backend, "docker/web/Dockerfile"),
-        backend,
-      ],
-      state,
+        source: backend,
+        dockerfile: join(backend, "docker/web/Dockerfile"),
+      },
       signal,
     );
-    // No change to the running Compose project until the replacement build succeeds.
+    // Leave the running deployment unchanged until the replacement build succeeds.
     state.image = image;
     const runtime = join(directory, "runtime");
     await mkdir(runtime, { recursive: true });
@@ -338,7 +296,7 @@ export class Deployments {
     state.phase = "starting";
     await this.save(state);
     try {
-      await this.compose(state, ["up", "-d"], signal);
+      await this.runtime.up(this.context(state), {}, signal);
       await this.waitReady(state, signal);
       state.generation = generation;
       state.backendSnapshot = snapshotName;
@@ -354,7 +312,7 @@ export class Deployments {
       state.generation = previous.generation;
       await this.files(state);
       if (state.resolved.length)
-        await this.compose(state, ["up", "-d", "app"], signal);
+        await this.runtime.up(this.context(state), { service: "app" }, signal);
       throw error;
     }
   }
@@ -419,9 +377,9 @@ export class Deployments {
       state.phase = "restarting";
       try {
         await this.files(state);
-        await this.compose(
-          state,
-          ["up", "-d", "--force-recreate", "app"],
+        await this.runtime.up(
+          this.context(state),
+          { service: "app", recreate: true },
           signal,
         );
         await this.waitReady(state, signal);
@@ -431,7 +389,10 @@ export class Deployments {
         state.port = previous.port;
         state.properties = previous.properties;
         await this.files(state);
-        await this.compose(state, ["up", "-d", "--force-recreate", "app"]);
+        await this.runtime.up(this.context(state), {
+          service: "app",
+          recreate: true,
+        });
         throw error;
       }
     });
@@ -441,7 +402,7 @@ export class Deployments {
     return this.start(state, "restart", async (signal) => {
       state.phase = "restarting";
       await this.save(state);
-      await this.compose(state, ["restart", "app"], signal);
+      await this.runtime.restartApp(this.context(state), signal);
       await this.waitReady(state, signal);
       state.phase = "ready";
       await this.save(state);
@@ -458,7 +419,11 @@ export class Deployments {
         signal,
       );
       const image = `${state.id}:importer-${state.generation}`;
-      await this.docker(["build", "-t", image, core], state, signal);
+      await this.runtime.build(
+        this.context(state),
+        { image, source: core },
+        signal,
+      );
       state.importerImage = image;
       await this.save(state);
     }
@@ -475,13 +440,10 @@ export class Deployments {
       stage: "Rebuilding derived tables",
     };
     await this.save(state);
-    await this.compose(state, ["stop", "app"], signal);
-    await this.compose(
-      state,
+    await this.runtime.stopApp(this.context(state), signal);
+    await this.runtime.execDatabase(
+      this.context(state),
       [
-        "exec",
-        "-T",
-        "database",
         "sh",
         "-c",
         'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database "$CLICKHOUSE_DB" --multiquery --param_optimize_backoff_secs=0 < /runtime/derived.sql',
@@ -494,7 +456,7 @@ export class Deployments {
       stage: "Starting backend",
     };
     await this.save(state);
-    await this.compose(state, ["up", "-d", "app"], signal);
+    await this.runtime.up(this.context(state), { service: "app" }, signal);
     await this.waitReady(state, signal);
   }
   async importStudies(input: z.input<typeof importSchema>) {
@@ -540,50 +502,19 @@ export class Deployments {
           };
           await this.save(state);
           // All mounts are snapshots. The importer may write validation output without changing original studies.
-          try {
-            await this.docker(
-              [
-                "run",
-                "--name",
-                `${state.id}-import`,
-                "--memory",
-                "4g",
-                "--network",
-                `${state.id}_default`,
-                "-v",
-                `${copy}:/study`,
-                "-v",
-                `${runtime}:/runtime:ro`,
-                "-v",
-                `${reference}:/reference:ro`,
-                "-e",
-                `IMPORT_GENE_PANELS=${index === 0 ? "1" : "0"}`,
-                "-e",
-                "PORTAL_HOME=/runtime",
-                "-e",
-                "PYTHONUNBUFFERED=1",
-                "--entrypoint",
-                "sh",
-                importerImage,
-                "/runtime/import.sh",
-                ...(parsed.overrideWarnings ? ["-o"] : []),
-              ],
-              state,
-              signal,
-            );
-          } finally {
-            const existing = await this.execute([
-              "docker",
-              "--host",
-              localDockerHost(),
-              "ps",
-              "-aq",
-              "--filter",
-              `name=^${state.id}-import$`,
-            ]);
-            if (existing)
-              await this.docker(["rm", "-f", `${state.id}-import`], state);
-          }
+          await this.runtime.runImporter(
+            this.context(state),
+            {
+              image: importerImage,
+              operation: "import",
+              script: "/runtime/import.sh",
+              args: parsed.overrideWarnings ? ["-o"] : [],
+              study: copy,
+              reference,
+              importGenePanels: index === 0,
+            },
+            signal,
+          );
         }
         await this.refreshAfterDataChange(state, paths.length, signal);
         state.phase = "ready";
@@ -597,7 +528,7 @@ export class Deployments {
       } finally {
         // Restore the backend even if rebuilding derived tables or cancellation failed.
         if (state.phase !== "ready")
-          await this.compose(state, ["up", "-d", "app"]);
+          await this.runtime.up(this.context(state), { service: "app" });
         await rm(imports, { recursive: true, force: true });
       }
     });
@@ -625,51 +556,23 @@ export class Deployments {
       try {
         const image = await this.ensureImporter(state, signal);
         await writeFile(join(runtime, "delete.sh"), deleteScript);
-        await this.compose(state, ["stop", "app"], signal);
+        await this.runtime.stopApp(this.context(state), signal);
         state.progress = {
           completed: 1,
           total: 4,
           stage: `Deleting ${parsed.studyIds.length} studies`,
         };
         await this.save(state);
-        try {
-          await this.docker(
-            [
-              "run",
-              "--name",
-              `${state.id}-delete`,
-              "--memory",
-              "4g",
-              "--network",
-              `${state.id}_default`,
-              "-v",
-              `${runtime}:/runtime:ro`,
-              "-e",
-              "PORTAL_HOME=/runtime",
-              "-e",
-              "PYTHONUNBUFFERED=1",
-              "--entrypoint",
-              "sh",
-              image,
-              "/runtime/delete.sh",
-              parsed.studyIds.join(","),
-            ],
-            state,
-            signal,
-          );
-        } finally {
-          const container = await this.execute([
-            "docker",
-            "--host",
-            localDockerHost(),
-            "ps",
-            "-aq",
-            "--filter",
-            `name=^${state.id}-delete$`,
-          ]);
-          if (container)
-            await this.docker(["rm", "-f", `${state.id}-delete`], state);
-        }
+        await this.runtime.runImporter(
+          this.context(state),
+          {
+            image,
+            operation: "delete",
+            script: "/runtime/delete.sh",
+            args: [parsed.studyIds.join(",")],
+          },
+          signal,
+        );
         await this.refreshAfterDataChange(state, 1, signal);
         const after = await apiRequest(
           state.port,
@@ -692,7 +595,7 @@ export class Deployments {
         await this.save(state);
       } finally {
         if (state.phase !== "ready")
-          await this.compose(state, ["up", "-d", "app"]);
+          await this.runtime.up(this.context(state), { service: "app" });
       }
     });
   }
@@ -714,7 +617,7 @@ export class Deployments {
         await this.save(state);
       } finally {
         if (state.phase !== "ready")
-          await this.compose(state, ["up", "-d", "app"]);
+          await this.runtime.up(this.context(state), { service: "app" });
       }
     });
   }
@@ -726,21 +629,7 @@ export class Deployments {
     const state = this.get(id);
     let output: string;
     if (service) {
-      output = await this.execute([
-        "docker",
-        "--host",
-        localDockerHost(),
-        "compose",
-        "-p",
-        id,
-        "-f",
-        join(this.directory(id), "compose.json"),
-        "logs",
-        "--no-color",
-        "--tail",
-        String(lines),
-        service,
-      ]);
+      output = await this.runtime.logs(this.context(state), service, lines);
     } else {
       try {
         const file = await open(
@@ -790,12 +679,7 @@ export class Deployments {
   destroy(id: string, deleteData: boolean) {
     const state = this.get(id);
     return this.start(state, "destroy", async (signal) => {
-      if (await Bun.file(join(this.directory(id), "compose.json")).exists())
-        await this.compose(
-          state,
-          ["down", ...(deleteData ? ["-v"] : [])],
-          signal,
-        );
+      await this.runtime.destroy(this.context(state), deleteData, signal);
       state.phase = "stopped";
       await this.save(state);
     });
@@ -822,11 +706,4 @@ async function availablePort(port: number) {
       listener.close((error) => (error ? reject(error) : resolvePromise())),
     );
   });
-}
-
-function localDockerHost() {
-  const host = process.env.DOCKER_HOST ?? "unix:///var/run/docker.sock";
-  if (!host.startsWith("unix://"))
-    throw new Error("Only local Unix-socket Docker is supported");
-  return host;
 }
