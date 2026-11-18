@@ -1,5 +1,6 @@
 import { McpServer, type ServerContext } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { configuredRuntime } from "./runtime-config";
 import { apiSchema } from "./api";
 import { z } from "zod/v4";
 import {
@@ -99,7 +100,7 @@ export function createMcpServer(deployments: Deployments) {
   }
   tool(
     "deploy",
-    "Build cBioPortal sources and start an isolated localhost Docker deployment. Returns immediately; poll status and logs for readiness. Core source selects the importer when importing studies.",
+    "Build cBioPortal sources and start an isolated deployment with a localhost endpoint. Returns immediately; poll status and logs for readiness. Core source selects the importer when importing studies.",
     deploySchema,
     (input) => deployments.deploy(input),
   );
@@ -117,7 +118,7 @@ export function createMcpServer(deployments: Deployments) {
   );
   tool(
     "logs",
-    "Read bounded build/import logs or a service’s Docker logs.",
+    "Read bounded build/import logs or a service’s logs.",
     identifierSchema.extend({
       service: z.enum(["app", "database", "session", "mongo"]).optional(),
       lines: z.number().int().min(1).max(1000).default(100),
@@ -203,7 +204,11 @@ export function createMcpServer(deployments: Deployments) {
 }
 
 if (import.meta.main) {
-  const deployments = new Deployments();
+  const deployments = new Deployments(
+    undefined,
+    undefined,
+    configuredRuntime(),
+  );
   await deployments.initialize();
   const server = createMcpServer(deployments);
   let shuttingDown = false;

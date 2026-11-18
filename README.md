@@ -1,6 +1,7 @@
 # cBioPortal deployment MCP
 
-A Bun/TypeScript stdio MCP for disposable cBioPortal instances on a local Docker daemon.
+A Bun/TypeScript stdio MCP for disposable cBioPortal instances. The default runtime
+uses a local Docker daemon; an opt-in Kubernetes runtime is under development.
 Each deployment has a loopback port, ClickHouse database, MongoDB session volume, and
 backend image. Browser acceptance testing stays in the Playwright MCP; `api_request`
 supports API checks against the same instance.
@@ -61,6 +62,60 @@ source snapshots and operation logs live under `CBIO_MCP_HOME`, defaulting to
 `~/.local/share/cbio-deployment-mcp`. Run one server per state directory.
 
 ## Deploy sources
+
+### Kubernetes runtime (experimental)
+
+This backend launches workloads with `kubectl` and builds/pushes images using
+`buildctl`. It does not need a Docker daemon or socket. It is not yet validated
+end to end against the dev cluster; do not switch an existing Engineer profile
+until portal, import, deletion, browser and companion-stack acceptance passes.
+
+Run the MCP directly with Bun (not `docker/run.sh`) with these settings:
+
+```sh
+export CBIO_RUNTIME=kubernetes
+export CBIO_MCP_HOME=/absolute/path/to/separate-kubernetes-state
+export CBIO_KUBE_CONTEXT=your-explicit-development-context
+export CBIO_IMAGE_REPOSITORY=registry.example/team/engineer
+export CBIO_BUILDKIT_ADDR=unix:///run/buildkit/buildkitd.sock
+export CBIO_KUBE_WORKSPACE_CLASS=your-rwx-filesystem-class
+export CBIO_KUBE_DATABASE_CLASS=your-block-storage-class
+bun run start
+```
+
+Provision the registry repository, an authenticated BuildKit service, its registry
+credentials, node image-pull access, and the storage classes first. The workspace
+class must support `ReadWriteMany`; it holds scripts and copied input files, not
+database data directories. ClickHouse and MongoDB each use separate
+`ReadWriteOnce` claims. The optional `CBIO_KUBE_NODE_SELECTOR` is a JSON object
+of node-label constraints. Each portal requests approximately 7.6 GiB for its
+services/workspace; an importer additionally requests 4 GiB. BuildKit needs its
+own resource budget. Namespace quota/admission rules may impose further limits.
+
+The kube identity needs access to create an owned namespace and manage its
+Deployments, Services, Secrets, PVCs and Jobs, plus pod logs, exec and port-forward.
+Do not grant these permissions by reusing production administrator credentials.
+Workload pods do not receive a Kubernetes API token. The current backend manages
+the four standard portal services; arbitrary Compose companion stacks still need
+their own Kubernetes support before the complete Engineer migration is ready.
+
+Deployment URLs remain on localhost through a managed `kubectl port-forward`.
+Stopping the MCP closes its tunnels, but retains workloads and data. A ready
+deployment reconnects when its state is reopened; API requests also check the
+tunnel. Automatic recovery of a tunnel used only by an external preview client
+is not implemented yet. `destroy(deleteData=false)` stops workloads and retains
+claims; `destroy(deleteData=true)` deletes the owned namespace and its claims
+(the storage-class reclaim policy determines underlying volume deletion).
+
+Imports and deletions use Jobs with no automatic retry, a 45-minute deadline,
+and foreground cleanup even on cancellation. Kubernetes Jobs are not an
+exactly-once execution system; operational recovery still requires inspecting
+the database after an interruption. Completed Job output is saved in the local
+operation log. In-progress output is available through Kubernetes pod logs.
+
+Runtime identity is saved with each deployment. Legacy state is treated as
+Docker state and is rejected in Kubernetes mode, preventing accidental
+operations against a different backend. Use a fresh state directory for tests.
 
 Call `deploy` with a local clone:
 

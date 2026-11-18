@@ -47,6 +47,7 @@ export const deploySchema = z
   })
   .strict();
 const stateSchema = deploySchema.extend({
+  runtime: z.enum(["docker", "kubernetes"]).default("docker"),
   id: idSchema,
   password: z.string(),
   image: z.string(),
@@ -130,7 +131,18 @@ export class Deployments {
         state.error =
           "MCP exited during an operation; inspect logs before redeploying";
       }
+      if (state.runtime !== (this.runtime.kind ?? "docker"))
+        throw new Error(
+          "Deployment runtime differs from saved state; use a separate CBIO_MCP_HOME",
+        );
       this.states.set(id, state);
+    }
+    try {
+      for (const state of this.states.values())
+        await this.runtime.restore?.(this.context(state));
+    } catch (error) {
+      await this.runtime.close?.();
+      throw error;
     }
   }
 
@@ -226,6 +238,7 @@ export class Deployments {
     const id = `cbio-mcp-${randomBytes(6).toString("hex")}`;
     const state: Deployment = {
       ...parsed,
+      runtime: this.runtime.kind ?? "docker",
       id,
       password: randomBytes(24).toString("hex"),
       image: `${id}:1`,
@@ -674,6 +687,7 @@ export class Deployments {
     const state = this.get(id);
     if (state.phase !== "ready" || this.tasks.has(id))
       throw new Error("Deployment must be ready and idle for API requests");
+    await this.runtime.restore?.(this.context(state));
     return apiRequest(state.port, input, signal);
   }
   destroy(id: string, deleteData: boolean) {
@@ -695,6 +709,7 @@ export class Deployments {
     await Promise.allSettled(
       Array.from(this.tasks.values(), (task) => task.promise),
     );
+    await this.runtime.close?.();
   }
 }
 

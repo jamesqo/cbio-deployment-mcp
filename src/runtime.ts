@@ -23,6 +23,9 @@ export type Service = "app" | "database" | "session" | "mongo";
  * even on cancellation. destroy(false) must retain database/session data.
  */
 export interface DeploymentRuntime {
+  readonly kind?: "docker" | "kubernetes";
+  restore?(context: RuntimeContext): Promise<void>;
+  close?(): Promise<void>;
   prepare(context: RuntimeContext): Promise<void>;
   build(
     context: RuntimeContext,
@@ -60,6 +63,7 @@ export interface DeploymentRuntime {
 
 /** Compatibility backend, retained until Kubernetes passes workflow acceptance. */
 export class DockerRuntime implements DeploymentRuntime {
+  readonly kind = "docker" as const;
   constructor(private readonly execute = run) {}
 
   async prepare({ state, directory }: RuntimeContext) {
